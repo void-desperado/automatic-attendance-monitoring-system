@@ -1,6 +1,6 @@
 enroll_images/
 
-face_attendance_data/
+streamlit_attendance_data/
 
 # Windows alternate data streams (Zone.Identifier)
 **/*:Zone.Identifier
