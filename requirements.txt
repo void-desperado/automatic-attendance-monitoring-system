@@ -2,7 +2,9 @@ streamlit
 numpy
 opencv-python
 Pillow
-torch
-facenet-pytorch
-retina-face
 pandas
+scikit-learn
+scrfd
+insightface
+onnxruntime
+facenet-pytorch
