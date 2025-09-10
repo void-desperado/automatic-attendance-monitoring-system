@@ -1,9 +1,10 @@
 # automatic-attendance-monitoring-system
 
-A Streamlit-based face-attendance app using RetinaFace for detection and FaceNet (facenet-pytorch) for embeddings.  
-Allows you to enroll students from photos, take attendance from a group/class photo, and export a CSV + visualization image showing present / absent people.
+A Streamlit-based offline/local face-attendance app.
+Detects faces with SCRFD and computes face embeddings (default: InsightFace — buffalo_l; optional: FaceNet / facenet-pytorch).
+Enroll students from photos (name, SAP ID, email) to build per-student prototype embeddings, then mark attendance from a group photo with manual verification and CSV/annotated-image export.
 
-> **Note:** This repository contains code only. The app creates and stores runtime data under `face_attendance_data/`. Do **not** commit that folder or any student images to version control.
+> **Note:** This repository contains code only. The app creates and stores runtime data under `streamlit_attendance_data/`. Do **not** commit that folder or any student images to version control.
 
 ---
 
@@ -40,10 +41,16 @@ If you plan to use this in production or share with others, treat the current co
 
 ## Requirements
 
-- Python 3.8–3.11 recommended
-- `requirements.txt` included — install via `pip install -r requirements.txt`
-- `torch` should match your platform/CUDA if you plan to use GPU acceleration (install the correct PyTorch wheel).  
-- Tested components: `streamlit`, `numpy`, `opencv-python`, `Pillow`, `facenet-pytorch`, `retina-face` (package name may vary), `pandas`.
+streamlit
+numpy
+opencv-python
+Pillow
+pandas
+scikit-learn
+scrfd
+insightface
+onnxruntime
+facenet-pytorch    # if you want to use FaceNet alternative
 
 ---
 
@@ -73,5 +80,10 @@ pip install -r requirements.txt
 ```
 streamlit run app.py
 ```
-
 Open the local URL shown by Streamlit (usually http://localhost:8501).
+
+## Acknowledgements
+
+SCRFD models and implementations (face detection)
+InsightFace / ArcFace and facenet-pytorch communities (face embeddings)
+Streamlit for the easy web UI
