@@ -1,14 +1,4 @@
 # app.py
-"""
-Student Attendance Webapp (Streamlit)
-Fix: correctly handle student folders named only by SAPID (numeric folder names).
-Includes:
-- SCRFD (ONNX) detector + InsightFace embeddings
-- Enrollment (single student with name/sapid/email and ZIP bulk)
-- Robust DB loader + migration (handles older .npz without sapids/emails)
-- Attendance marking, annotated image, face preview grid, absent overlay
-- Manual verification: inspect enrolled photos and mark absent as present
-"""
 
 import streamlit as st
 from pathlib import Path
@@ -19,6 +9,13 @@ import cv2
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 from sklearn.metrics.pairwise import cosine_similarity
+
+# ---------- OTP / email imports ----------
+import secrets
+import smtplib
+from email.message import EmailMessage
+import ssl
+from datetime import datetime, timedelta
 
 # ---------- Folders & config ----------
 BASE_DIR = Path.cwd()
@@ -54,6 +51,21 @@ SIM_THRESHOLD = st.sidebar.slider("Cosine similarity threshold (matching)", 0.20
 DETECT_PROB = st.sidebar.slider("SCRFD detection probability threshold", 0.2, 0.8, 0.35, 0.01)
 PAD_RATIO = st.sidebar.slider("Crop padding ratio (for enroll)", 0.0, 0.4, 0.12, 0.01)
 
+# ---------- OTP sidebar controls (added) ----------
+st.sidebar.header("OTP (challenge) settings")
+otp_enable = st.sidebar.checkbox("Enable OTP challenge for borderline matches", value=False)
+otp_lower = st.sidebar.slider("OTP lower bound (similarity)", 0.00, 0.80, 0.30, 0.01)
+otp_upper = st.sidebar.slider("OTP upper bound (similarity)", 0.00, 0.80, 0.45, 0.01)
+otp_method = st.sidebar.radio("OTP delivery", ("Show in admin UI (default)", "Send by Email"), index=0)
+st.sidebar.markdown("**Email (optional)** — only used if you choose 'Send by Email'")
+smtp_server = st.sidebar.text_input("SMTP server (e.g. smtp.gmail.com)", value="")
+smtp_port = st.sidebar.number_input("SMTP port", value=587)
+smtp_user = st.sidebar.text_input("SMTP username (from-email)", value="")
+smtp_password = st.sidebar.text_input("SMTP password (app password)", type="password")
+smtp_from = st.sidebar.text_input("From email", value=smtp_user or "")
+use_tls = st.sidebar.checkbox("Use TLS for SMTP", value=True)
+otp_length = 6
+otp_ttl_seconds = 10 * 60  # OTP expiry (10 minutes)
 
 # ---------- Cached model loading ----------
 @st.cache_resource(show_spinner=False)
@@ -260,6 +272,32 @@ def make_thumbnail_from_bgr(cv2_img_bgr, size=128):
     pil = Image.fromarray(cv2.cvtColor(cv2_img_bgr, cv2.COLOR_BGR2RGB))
     pil.thumbnail((size,size))
     return pil
+
+
+# ---------- OTP helpers (added) ----------
+def generate_otp(n=6):
+    return "".join([secrets.choice("0123456789") for _ in range(n)])
+
+def send_otp_email(to_email, subject, body, server, port, user, password, use_tls=True, from_addr=None):
+    if not to_email:
+        raise ValueError("Recipient email empty")
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_addr or user
+    msg["To"] = to_email
+    msg.set_content(body)
+    context = ssl.create_default_context()
+    if use_tls:
+        with smtplib.SMTP(server, port, timeout=10) as smtp:
+            smtp.starttls(context=context)
+            if user and password:
+                smtp.login(user, password)
+            smtp.send_message(msg)
+    else:
+        with smtplib.SMTP_SSL(server, port, context=context, timeout=10) as smtp:
+            if user and password:
+                smtp.login(user, password)
+            smtp.send_message(msg)
 
 
 # ---------- Enrollment UI ----------
@@ -504,6 +542,9 @@ if st.button("Run Attendance") and group_file is not None:
                 results_info = []
                 present_indices = set()
                 face_previews = []
+                # prepare a temporary OTP store for this run
+                if 'otp_tmp_store' in st.session_state:
+                    del st.session_state['otp_tmp_store']
                 for det in detections:
                     x1,y1,x2,y2 = det['xyxy']
                     crop = group_img[y1:y2, x1:x2].copy()
@@ -521,15 +562,69 @@ if st.button("Run Attendance") and group_file is not None:
                         results_info.append({"xyxy":det["xyxy"], "name":"Unknown", "score":0.0})
                         face_previews.append({"thumb":make_thumbnail_from_bgr(crop), "name":"Unknown", "score":0.0})
                         continue
-                    sims = cosine_similarity(emb.reshape(1,-1), emb_db).ravel()
-                    best_idx = int(np.argmax(sims)); best_sim = float(sims[best_idx])
-                    if best_sim >= SIM_THRESHOLD:
+
+                    # ---------- matching with optional OTP logic (added) ----------
+                    try:
+                        sims = cosine_similarity(emb.reshape(1,-1), emb_db).ravel()
+                        best_idx = int(np.argmax(sims)); best_sim = float(sims[best_idx])
+                    except Exception:
+                        best_idx = None; best_sim = 0.0
+
+                    name = "Unknown"
+                    otp_for_this_student = None
+
+                    # Determine present vs OTP vs unknown
+                    if best_idx is not None and best_sim >= SIM_THRESHOLD:
                         present_indices.add(best_idx)
                         name = names[best_idx] or sapids[best_idx] or "Unknown"
                     else:
-                        name = "Unknown"
+                        # check OTP window
+                        if otp_enable and (best_idx is not None) and (otp_lower <= best_sim < otp_upper):
+                            # prepare OTP entry but DO NOT mark as present automatically
+                            code = generate_otp(otp_length)
+                            expires_at = (datetime.now() + timedelta(seconds=otp_ttl_seconds)).isoformat()
+                            otp_for_this_student = {"student_idx": best_idx, "code": code, "expires_at": expires_at, "sent": False}
+                            recipient = None
+                            if otp_method == "Send by Email" and (smtp_server and smtp_user and smtp_password):
+                                recipient = emails[best_idx] if (best_idx is not None and best_idx < len(emails)) else None
+                                if recipient:
+                                    try:
+                                        subj = "Your attendance OTP"
+                                        body = f"Your OTP for attendance verification is: {code}\nThis code expires at {expires_at}."
+                                        send_otp_email(recipient, subj, body,
+                                                       server=smtp_server, port=int(smtp_port),
+                                                       user=smtp_user, password=smtp_password, use_tls=use_tls,
+                                                       from_addr=(smtp_from or smtp_user))
+                                        otp_for_this_student["sent"] = True
+                                    except Exception as e:
+                                        otp_for_this_student["sent"] = False
+                                        otp_for_this_student["send_error"] = str(e)
+                                else:
+                                    otp_for_this_student["sent"] = False
+                            else:
+                                otp_for_this_student["sent"] = False
+
+                            name = names[best_idx] if best_idx is not None and best_idx < len(names) else (sapids[best_idx] if best_idx is not None else "Unknown")
+                        else:
+                            name = "Unknown"
+
                     results_info.append({"xyxy":det["xyxy"], "name":name, "score":best_sim})
                     face_previews.append({"thumb":make_thumbnail_from_bgr(crop), "name":name, "score":best_sim})
+
+                    # store OTP info for later UI if created
+                    if otp_for_this_student:
+                        if 'otp_tmp_store' not in st.session_state:
+                            st.session_state['otp_tmp_store'] = []
+                        st.session_state['otp_tmp_store'].append({
+                            "student_idx": otp_for_this_student["student_idx"],
+                            "code": otp_for_this_student["code"],
+                            "expires_at": otp_for_this_student["expires_at"],
+                            "sent": otp_for_this_student["sent"],
+                            "send_error": otp_for_this_student.get("send_error", None),
+                            "name": name,
+                            "email": recipient if 'recipient' in locals() else None,
+                            "best_sim": best_sim
+                        })
 
                 enrolled_indices = set(range(len(names)))
                 absent_indices = sorted(list(enrolled_indices - present_indices))
@@ -548,6 +643,27 @@ if st.button("Run Attendance") and group_file is not None:
                     "face_previews": face_previews,
                     "annotated_bytes": buf.getvalue()
                 }
+
+                # attach OTPs from temporary store into the attendance results (added)
+                otps = {}
+                if 'otp_tmp_store' in st.session_state:
+                    for o in st.session_state['otp_tmp_store']:
+                        idx = o['student_idx']
+                        if idx is None:
+                            continue
+                        otps[int(idx)] = {
+                            "code": o["code"],
+                            "expires_at": o["expires_at"],
+                            "sent": o["sent"],
+                            "send_error": o.get("send_error"),
+                            "name": o.get("name"),
+                            "email": o.get("email"),
+                            "best_sim": o.get("best_sim")
+                        }
+                    # clear temporary store
+                    del st.session_state['otp_tmp_store']
+                st.session_state['attendance_results']['otps'] = otps
+
                 st.success(f"Attendance done. Present: {len(present_indices)}; Absent: {len(absent_indices)}")
 
 
@@ -616,62 +732,139 @@ if res is not None:
             sel_sapid = sapids[sel_idx] or ""
             sel_email = emails[sel_idx] or ""
             st.write(f"**{sel_name or sel_sapid}** — SAPID: `{sel_sapid}` — Email: `{sel_email}`")
+
+            # Find student folder if present (we only report the count, do NOT show images)
             sdir = None
             guess_folder = f"{sel_sapid}_{(sel_name.replace(' ','_') if sel_name else '')}".rstrip("_")
             if sel_sapid and (ENROLL_DIR / guess_folder).exists():
                 sdir = ENROLL_DIR / guess_folder
             else:
                 for p in ENROLL_DIR.iterdir():
-                    if not p.is_dir(): continue
+                    if not p.is_dir():
+                        continue
                     meta_file = p / "meta.json"
                     if meta_file.exists():
                         try:
                             m = json.load(open(meta_file,'r',encoding='utf-8'))
                             if (sel_sapid and m.get("sapid","")==sel_sapid) or (sel_name and m.get("name","")==sel_name):
-                                sdir = p; break
+                                sdir = p
+                                break
                         except Exception:
                             pass
                     if sel_sapid and sel_sapid in p.name:
-                        sdir = p; break
+                        sdir = p
+                        break
                     if sel_name and sel_name.replace(" ","_") in p.name:
-                        sdir = p; break
-            imgs = sorted([p for p in (sdir.iterdir() if sdir and sdir.exists() else []) if p.suffix.lower() in {".jpg",".jpeg",".png",".bmp"}]) if sdir else []
+                        sdir = p
+                        break
+
+            imgs = sorted([p for p in (sdir.iterdir() if sdir and sdir.exists() else [])
+                           if p.suffix.lower() in {".jpg",".jpeg",".png",".bmp"}]) if sdir else []
+
             if len(imgs) == 0:
                 st.warning("No enrolled images found for this student (folder missing or empty).")
             else:
-                st.write(f"Showing {len(imgs)} enrolled image(s) for **{sel_name or sel_sapid}**")
-                cols = st.columns(min(len(imgs), 6))
-                for i,p in enumerate(imgs):
-                    with cols[i % len(cols)]:
+                # We intentionally DO NOT display thumbnails here — only inform the admin how many images exist.
+                st.info(f"{len(imgs)} enrolled image(s) are available for this student (not shown).")
+
+            if st.button(f"Mark '{sel_name or sel_sapid}' as Present"):
+                present_indices.add(sel_idx)
+                if sel_idx in absent_indices:
+                    absent_indices.remove(sel_idx)
+                absent_names_now = [names[i] or sapids[i] for i in absent_indices]
+                new_annot = draw_annotations_and_overlay(group_bgr, results_info, absent_names_now)
+                buf = BytesIO(); new_annot.save(buf, format="JPEG")
+                res["annotated_bytes"] = buf.getvalue()
+                res["present_indices"] = list(present_indices)
+                res["absent_indices"] = absent_indices
+                st.session_state['attendance_results'] = res
+                st.success(f"Marked {sel_name or sel_sapid} as Present. Roster and annotated image updated.")
+
+    # ---------- OTP verification UI (added) ----------
+    otps = res.get("otps", {}) or {}
+    if len(otps) > 0:
+        st.markdown("---")
+        st.subheader("OTP challenges")
+        for sid, oinfo in list(otps.items()):
+            try:
+                sid = int(sid)
+            except Exception:
+                continue
+            display_name = (names[sid] or sapids[sid]) if sid < len(names) else str(sid)
+            col1, col2, col3 = st.columns([2,2,1])
+            with col1:
+                st.write(f"**{display_name}** — similarity: {oinfo.get('best_sim',0.0):.3f} — email: {oinfo.get('email') or '—'}")
+                if oinfo.get("sent"):
+                    st.info("OTP sent to student email.")
+                elif oinfo.get("send_error"):
+                    st.warning(f"OTP send failed: {oinfo.get('send_error')}. OTP shown below.")
+                else:
+                    st.info("OTP available (shown below).")
+                st.write(f"OTP expires at: {oinfo.get('expires_at')}")
+                # show OTP to admin (if email not sent or for admin)
+                st.write(f"OTP (admin view): `{oinfo.get('code')}`")
+            with col2:
+                verify_key = f"otp_verify_{sid}"
+                entered = st.text_input("Enter OTP to verify", key=verify_key)
+                if st.button(f"Verify OTP for {display_name}", key=f"verify_btn_{sid}"):
+                    if entered.strip() == oinfo.get("code"):
+                        # mark present
+                        if sid not in res["present_indices"]:
+                            res["present_indices"].append(sid)
+                        # remove from absent if present
+                        if sid in res["absent_indices"]:
+                            res["absent_indices"].remove(sid)
+                        # remove OTP
+                        res["otps"].pop(sid, None)
+                        st.session_state['attendance_results'] = res
+                        st.success(f"{display_name} verified and marked Present.")
+                    else:
+                        st.error("Invalid OTP.")
+            with col3:
+                if st.button(f"Resend OTP to {display_name}", key=f"resend_{sid}"):
+                    # regenerate or resend existing code
+                    code = oinfo.get("code") or generate_otp(otp_length)
+                    expires_at = (datetime.now() + timedelta(seconds=otp_ttl_seconds)).isoformat()
+                    oinfo["code"] = code
+                    oinfo["expires_at"] = expires_at
+                    # try to send email if configured and email exists
+                    sent_flag = False
+                    if otp_method == "Send by Email" and smtp_server and smtp_user and smtp_password and oinfo.get("email"):
                         try:
-                            im = Image.open(p).convert("RGB")
-                            st.image(im, use_container_width=True)
-                        except Exception:
-                            st.image(Image.new("RGB",(128,128),(200,200,200)), use_container_width=True)
-                        st.caption(p.name)
-                if st.button(f"Mark '{sel_name or sel_sapid}' as Present"):
-                    present_indices.add(sel_idx)
-                    if sel_idx in absent_indices:
-                        absent_indices.remove(sel_idx)
-                    absent_names_now = [names[i] or sapids[i] for i in absent_indices]
-                    new_annot = draw_annotations_and_overlay(group_bgr, results_info, absent_names_now)
-                    buf = BytesIO(); new_annot.save(buf, format="JPEG")
-                    res["annotated_bytes"] = buf.getvalue()
-                    res["present_indices"] = list(present_indices)
-                    res["absent_indices"] = absent_indices
+                            send_otp_email(oinfo["email"], "Your attendance OTP", f"Your OTP: {code}\nExpires: {expires_at}",
+                                           server=smtp_server, port=int(smtp_port),
+                                           user=smtp_user, password=smtp_password, use_tls=use_tls,
+                                           from_addr=(smtp_from or smtp_user))
+                            oinfo["sent"] = True; sent_flag = True
+                        except Exception as e:
+                            oinfo["sent"] = False; oinfo["send_error"] = str(e)
+                            st.error("Failed to send email: " + str(e))
+                    else:
+                        oinfo["sent"] = False
+                    res["otps"][sid] = oinfo
                     st.session_state['attendance_results'] = res
-                    st.success(f"Marked {sel_name or sel_sapid} as Present. Roster and annotated image updated.")
+                    if sent_flag:
+                        st.success("OTP resent via email.")
+                    else:
+                        st.info(f"OTP regenerated (admin view): `{code}`")
+    else:
+        # no OTPs for this run
+        pass
 
     st.markdown("---")
     st.subheader("Downloads")
     attendance = []
     present_set = set(res["present_indices"])
+    otps = res.get("otps", {}) or {}
     for idx in range(len(names)):
+        otp_entry = otps.get(idx)
         attendance.append({
             "name": names[idx],
             "sapid": sapids[idx],
             "email": emails[idx],
-            "status": "Present" if idx in present_set else "Absent"
+            "status": "Present" if idx in present_set else "Absent",
+            "otp_required": bool(otp_entry),
+            "otp_sent": bool(otp_entry and otp_entry.get("sent"))
         })
     df_att = pd.DataFrame(attendance)
     st.download_button("Download attendance CSV", data=df_att.to_csv(index=False).encode("utf-8"), file_name="attendance.csv", mime="text/csv")
@@ -689,5 +882,14 @@ if DB_PATH.exists():
     st.download_button("Download enrollment DB (.npz)", data=dbb, file_name="enroll_db.npz")
 else:
     st.info("No enrollment DB available.")
+
+# Attendance logs listing utility (optional)
+logs_dir = OUTPUT_DIR / "attendance_logs"
+if logs_dir.exists():
+    st.subheader("Attendance history")
+    logs = sorted(logs_dir.glob("attendance_*.csv"), reverse=True)
+    for p in logs[:20]:
+        with open(p, "rb") as f:
+            st.download_button(f"Download {p.name}", data=f.read(), file_name=p.name)
 
 st.caption("Tips: tune similarity threshold. For production, align faces and use ONNX runtime optimizations or GPU.")
